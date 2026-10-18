@@ -4,7 +4,7 @@ import pandas as pd
 st.set_page_config(
     page_title="Weekly Liquidity Scanner",
     page_icon="📊",
-    layout="wide"
+    layout="centered"
 )
 
 st.title("📊 Weekly Liquidity Scanner")
