@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: wls-213-live
+    runtime: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: STATE_FILE
+        value: /tmp/wls213_status.json
+      - key: SCAN_INTERVAL_SECONDS
+        value: "300"
+      - key: TIMEZONE
+        value: Asia/Kolkata

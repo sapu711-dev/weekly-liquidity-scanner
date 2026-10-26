@@ -1,113 +1,63 @@
-import streamlit as st
-import pandas as pd
+from fastapi import FastAPI
+from fastapi.responses import HTMLResponse
+from pathlib import Path
+import json, os
+from datetime import datetime
+from zoneinfo import ZoneInfo
+import threading, logging
 
-st.set_page_config(
-    page_title="Weekly Liquidity Scanner",
-    page_icon="📊",
-    layout="centered"
-)
+app = FastAPI(title="WLS-213 Live Scanner")
+STATE = Path(os.getenv("STATE_FILE", "/tmp/wls213_status.json"))
+TZ = ZoneInfo("Asia/Kolkata")
 
-st.title("📊 Weekly Liquidity Scanner")
-st.caption("Weekly Liquidity Sweep | 15-minute signals")
+def status():
+    try:
+        data = json.loads(STATE.read_text())
+    except Exception:
+        data = {"running": False, "connected": False, "status": "Not configured", "last_scan": None, "buy_count": 0, "sell_count": 0, "signals": []}
+    data["server_time"] = datetime.now(TZ).isoformat()
+    return data
 
-uploaded_file = st.file_uploader(
-    "স্ক্যানারের CSV ফাইল আপলোড করুন",
-    type=["csv"]
-)
+@app.on_event("startup")
+def start_scanner_thread():
+    # Run the worker in this same service so its local status file is shared with the dashboard.
+    if os.getenv("WLS_DISABLE_WORKER", "false").lower() not in ("1", "true", "yes"):
+        def run_worker():
+            try:
+                from worker import scan_loop
+                scan_loop()
+            except Exception as exc:
+                logging.exception("WLS-213 worker stopped")
+                try:
+                    STATE.parent.mkdir(parents=True, exist_ok=True)
+                    STATE.write_text(json.dumps({
+                        "running": False, "connected": False,
+                        "status": f"ERROR: {exc}", "signals": [],
+                        "buy_count": 0, "sell_count": 0
+                    }, ensure_ascii=False))
+                except Exception:
+                    pass
+        threading.Thread(target=run_worker, daemon=True, name="wls213-worker").start()
 
-if uploaded_file is None:
-    st.info(
-        "প্রথমে Colab থেকে ডাউনলোড করা "
-        "weekly_scanner_signals.csv ফাইলটি আপলোড করুন।"
-    )
-    st.stop()
+@app.get("/health")
+def health():
+    return {"ok": True, "service": "WLS-213", "server_time": datetime.now(TZ).isoformat()}
 
-try:
-    df = pd.read_csv(uploaded_file)
-except Exception as e:
-    st.error(f"ফাইল পড়া যায়নি: {e}")
-    st.stop()
+@app.get("/api/status")
+def api_status():
+    return status()
 
-df.columns = df.columns.str.strip()
-
-required = ["time", "symbol", "signal"]
-missing = [c for c in required if c not in df.columns]
-
-if missing:
-    st.error(f"CSV-তে এই কলামগুলি নেই: {missing}")
-    st.stop()
-
-df["time"] = pd.to_datetime(df["time"], errors="coerce")
-df["signal"] = df["signal"].astype(str).str.upper().str.strip()
-df["symbol"] = df["symbol"].astype(str).str.strip()
-
-if "PWL" not in df.columns:
-    df["PWL"] = None
-if "PWH" not in df.columns:
-    df["PWH"] = None
-if "swing level" not in df.columns:
-    df["swing level"] = None
-if "close" not in df.columns:
-    df["close"] = None
-
-df = df.dropna(subset=["time"]).copy()
-df = df.sort_values("time", ascending=False)
-
-buy_count = (df["signal"] == "BUY").sum()
-sell_count = (df["signal"] == "SELL").sum()
-
-c1, c2, c3 = st.columns(3)
-c1.metric("Total Signals", len(df))
-c2.metric("BUY", int(buy_count))
-c3.metric("SELL", int(sell_count))
-
-st.divider()
-
-signal_choice = st.selectbox(
-    "Signal Filter",
-    ["ALL", "BUY", "SELL"]
-)
-
-search_symbol = st.text_input(
-    "স্টকের নাম খুঁজুন",
-    placeholder="যেমন SAIL"
-).strip().upper()
-
-filtered = df.copy()
-
-if signal_choice != "ALL":
-    filtered = filtered[filtered["signal"] == signal_choice]
-
-if search_symbol:
-    filtered = filtered[
-        filtered["symbol"].str.upper().str.contains(
-            search_symbol, na=False
-        )
-    ]
-
-display_columns = [
-    "time", "symbol", "signal",
-    "PWL", "PWH", "swing level", "close"
-]
-
-st.subheader("স্ক্যানারের সিগন্যাল")
-st.caption(f"দেখানো হচ্ছে {len(filtered)}টি সিগন্যাল")
-
-st.dataframe(
-    filtered[display_columns],
-    use_container_width=True,
-    hide_index=True
-)
-
-st.download_button(
-    "Filtered Results CSV ডাউনলোড",
-    data=filtered.to_csv(index=False).encode("utf-8"),
-    file_name="filtered_scanner_signals.csv",
-    mime="text/csv",
-    use_container_width=True
-)
-
-st.warning(
-    "এই স্ক্রিনে আপলোড করা CSV-র ফলাফল দেখা যায়। "
-    "নতুন লাইভ সিগন্যাল পেতে মার্কেট ডেটার সংযোগ আলাদাভাবে করতে হবে।"
-)
+@app.get("/", response_class=HTMLResponse)
+def home():
+    return HTML
+HTML = r"""<!doctype html><html lang="bn"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>WLS-213</title>
+<style>body{font-family:Arial,sans-serif;margin:0;background:#f3f5f7;color:#17202a}.wrap{max-width:900px;margin:auto;padding:16px}.top{background:#172b4d;color:white;padding:18px;border-radius:14px}.status{font-size:14px;margin-top:8px}.grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:14px}.panel{background:white;padding:12px;border-radius:12px;min-width:0}.buy{border-top:5px solid #15803d}.sell{border-top:5px solid #b91c1c}.item{border:1px solid #ddd;border-radius:9px;padding:10px;margin:8px 0;overflow-wrap:anywhere}.muted{color:#64748b;font-size:13px}@media(max-width:600px){.grid{grid-template-columns:1fr}}button{padding:10px 16px;border:0;border-radius:8px;background:#dbeafe}</style>
+<div class="wrap"><div class="top"><h2>WLS-213 — Weekly Liquidity Scanner</h2><div id="state" class="status">সার্ভারের অবস্থা দেখা হচ্ছে…</div><p class="muted">এটি কেবল সার্ভার-স্ট্যাটাস ড্যাশবোর্ড। এখানে ON/OFF কন্ট্রোল দেখানো হয় না যতক্ষণ না নিরাপদ authenticated control যুক্ত হয়।</p></div>
+<div class="grid"><section class="panel buy"><h3>BUY <span id="bc">0</span></h3><div id="buys">কোনো সিগন্যাল নেই</div></section><section class="panel sell"><h3>SELL <span id="sc">0</span></h3><div id="sells">কোনো সিগন্যাল নেই</div></section></div>
+<p class="muted">সার্ভার সময়: <span id="clock">—</span></p></div>
+<script>
+function esc(v){return String(v??'—').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+function cards(rows){if(!rows||!rows.length)return '<p>কোনো সিগন্যাল নেই</p>';return rows.map(x=>`<div class="item"><b>${esc(x.symbol)} — ${esc(x.signal)}</b><br>সময়: ${esc(x.time)}<br>Close: ₹${esc(x.close)}<br>PWL: ${esc(x.PWL)} | PWH: ${esc(x.PWH)}<br>Swing: ${esc(x.swing_level)}</div>`).join('')}
+async function refresh(){try{let r=await fetch('/api/status',{cache:'no-store'});let d=await r.json();document.getElementById('state').textContent=`অবস্থা: ${d.status||'অজানা'} | সংযোগ: ${d.connected?'যুক্ত':'যুক্ত নয়'} | স্ক্যান: ${d.running?'চলছে':'চলছে না'} | শেষ স্ক্যান: ${d.last_scan||'এখনও নয়'}`;document.getElementById('bc').textContent=d.buy_count||0;document.getElementById('sc').textContent=d.sell_count||0;document.getElementById('buys').innerHTML=cards((d.signals||[]).filter(x=>x.signal==='BUY'));document.getElementById('sells').innerHTML=cards((d.signals||[]).filter(x=>x.signal==='SELL'));document.getElementById('clock').textContent=d.server_time||'—'}catch(e){document.getElementById('state').textContent='সার্ভারে যোগাযোগ হচ্ছে না';}}
+refresh();setInterval(refresh,15000);
+</script></html>"""

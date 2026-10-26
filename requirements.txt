@@ -1,0 +1,7 @@
+fastapi>=0.110,<1
+uvicorn[standard]>=0.29,<1
+pandas>=2.0,<3
+requests>=2.31,<3
+python-dotenv>=1,<2
+kotakneoapi
+pyotp>=2.9,<3
