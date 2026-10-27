@@ -69,7 +69,7 @@ def load_symbols(client):
     for c in ["pExchSeg","pTrdSymbol","pSymbol","pSymbolName"]:
         if c not in cm.columns: raise RuntimeError("Unexpected cash scrip master columns")
         cm[c]=cm[c].astype(str).str.strip()
-    eq=cm[(cm.pExchSeg.str.lower()=="nse_cm")&cm.pTrdSymbol.str.endswith("-EQ")&cm.pSymbol.str.fullmatch(r"\\d+",na=False)]
+    eq=cm[(cm.pExchSeg.str.lower()=="nse_cm")&cm.pTrdSymbol.str.endswith("-EQ")&cm.pSymbol.str.fullmatch(r"\d+",na=False)]
     mapped=eq[eq.pSymbolName.str.upper().isin(names)][["pSymbolName","pSymbol","pTrdSymbol"]].drop_duplicates("pSymbolName")
     rows=[{"symbol":r.pSymbolName.upper(),"token":str(r.pSymbol),"trade_symbol":r.pTrdSymbol} for r in mapped.itertuples(index=False)]
     if not rows: raise RuntimeError("No cash EQ tokens mapped from live scrip masters")
