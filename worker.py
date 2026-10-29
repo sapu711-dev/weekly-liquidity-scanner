@@ -16,6 +16,11 @@ TZ = ZoneInfo("Asia/Kolkata")
 STATE = Path(os.getenv("STATE_FILE", "/tmp/wls213_status.json"))
 LOG = logging.getLogger("wls213")
 
+REQUEST_DELAY = max(
+    5.0, float(os.getenv("KOTAK_REQUEST_DELAY_SECONDS", "5"))
+)
+MAX_ATTEMPTS = 4
+
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
     format="%(asctime)s %(levelname)s %(message)s"
@@ -84,8 +89,42 @@ def is_rate_limited(value):
     )
 
 
+def is_timeout(value):
+    message = str(value).lower()
+    return (
+        "timeout" in message
+        or "timed out" in message
+        or "request timeout" in message
+    )
+
+
+def historical_candles(response):
+    """Extract candles from supported historical response formats."""
+    if isinstance(response, list):
+        return response
+
+    if not isinstance(response, dict):
+        return None
+
+    data = response.get("data")
+
+    if isinstance(data, list):
+        return data
+
+    if isinstance(data, dict):
+        candles = data.get("candles")
+        if isinstance(candles, list):
+            return candles
+
+    candles = response.get("candles")
+    if isinstance(candles, list):
+        return candles
+
+    return None
+
+
 def response_ok(response, historical=False):
-    """Validate common Kotak API response formats."""
+    """Validate login responses and historical candle responses."""
     if isinstance(response, list):
         return historical
 
@@ -95,9 +134,21 @@ def response_ok(response, historical=False):
     if response.get("error"):
         return False
 
-    for key in ("status_code", "statusCode", "stCode"):
+    if is_rate_limited(response):
+        return False
+
+    for key in ("status_code", "statusCode", "stCode", "code"):
         code = response.get(key)
-        if code is not None and str(code).strip() not in ("", "200"):
+
+        if code is None or str(code).strip() == "":
+            continue
+
+        value = str(code).strip().lower()
+
+        if value in ("200", "0", "success", "ok"):
+            continue
+
+        if value.isdigit():
             return False
 
     candidates = [
@@ -110,18 +161,15 @@ def response_ok(response, historical=False):
         ),
     ]
 
-    for value in candidates:
-        if str(value).strip().lower() in (
-            "success", "successful", "ok"
-        ):
-            return True
+    if any(
+        str(value).strip().lower()
+        in ("success", "successful", "ok")
+        for value in candidates
+    ):
+        return True
 
     if historical:
-        data = response.get("data")
-        if isinstance(data, list):
-            return True
-        if isinstance(data, dict):
-            return isinstance(data.get("candles"), list)
+        return historical_candles(response) is not None
 
     return False
 
@@ -256,28 +304,21 @@ def load_symbols(client):
     if not rows:
         raise RuntimeError("No NSE cash EQ tokens mapped.")
 
-    csv_lines = ["symbol,token,trade_symbol\n"]
-    for item in rows:
-        csv_lines.append(
-            f"{item['symbol']},{item['token']},"
-            f"{item['trade_symbol']}\n"
-        )
-
-    Path("cash_stock_map.csv").write_text(
-        "".join(csv_lines),
-        encoding="utf-8"
+    pd.DataFrame(rows).to_csv(
+        "cash_stock_map.csv",
+        index=False
     )
 
     return rows
 
 
 def candles_for(client, row):
-    """Fetch historical candles, retrying rate-limit errors."""
+    """Fetch candles with conservative pacing and transient retries."""
     today = datetime.now(TZ).date()
     start = (today - timedelta(days=35)).isoformat()
     end = today.isoformat()
 
-    for attempt in range(4):
+    for attempt in range(MAX_ATTEMPTS):
         try:
             response = client.historical_data(
                 neosymbol=f"nse_cm|{row['token']}",
@@ -287,38 +328,42 @@ def candles_for(client, row):
             )
 
             if is_rate_limited(response):
-                if attempt < 3:
-                    delay = 5 * (2 ** attempt)
-                    LOG.warning(
-                        "Rate limited for %s; retrying in %s seconds "
-                        "(attempt %s/4).",
-                        row["symbol"], delay, attempt + 1
-                    )
-                    time.sleep(delay)
-                    continue
-
-                raise RuntimeError(
-                    f"Kotak API rate limit persisted for {row['symbol']}."
-                )
+                raise RuntimeError("Kotak API rate limit 429")
 
             if not response_ok(response, historical=True):
+                if isinstance(response, dict):
+                    data = response.get("data")
+                    shape = {
+                        "keys": sorted(str(k) for k in response.keys()),
+                        "status": response.get("status"),
+                        "stat": response.get("stat"),
+                        "stCode": response.get("stCode"),
+                        "code": response.get("code"),
+                        "error_present": bool(response.get("error")),
+                        "data_type": type(data).__name__,
+                        "data_keys": (
+                            sorted(str(k) for k in data.keys())
+                            if isinstance(data, dict)
+                            else None
+                        ),
+                    }
+                else:
+                    shape = {
+                        "response_type": type(response).__name__
+                    }
+
+                LOG.warning(
+                    "Historical response shape rejected for %s: %s",
+                    row["symbol"], shape
+                )
                 raise RuntimeError(
                     "Historical API response not confirmed for "
                     f"{row['symbol']}."
                 )
 
-            if isinstance(response, list):
-                candles = response
-            else:
-                data = response.get("data", [])
-                if isinstance(data, dict):
-                    candles = data.get("candles", [])
-                elif isinstance(data, list):
-                    candles = data
-                else:
-                    candles = []
+            candles = historical_candles(response)
 
-            if not isinstance(candles, list):
+            if candles is None:
                 raise RuntimeError(
                     f"Unexpected candle format for {row['symbol']}."
                 )
@@ -326,20 +371,41 @@ def candles_for(client, row):
             return candles
 
         except Exception as exc:
-            if is_rate_limited(exc) and attempt < 3:
-                delay = 5 * (2 ** attempt)
+            limited = is_rate_limited(exc)
+            timed_out = is_timeout(exc)
+
+            if (limited or timed_out) and attempt < MAX_ATTEMPTS - 1:
+                delay = (
+                    15 * (2 ** attempt)
+                    if limited
+                    else 5 * (2 ** attempt)
+                )
+
                 LOG.warning(
-                    "Rate-limit exception for %s; retrying in %s seconds "
-                    "(attempt %s/4).",
-                    row["symbol"], delay, attempt + 1
+                    "Temporary API failure for %s: type=%s; "
+                    "retry in %s seconds; attempt %s/%s",
+                    row["symbol"],
+                    "rate_limit" if limited else "timeout",
+                    delay,
+                    attempt + 1,
+                    MAX_ATTEMPTS
                 )
                 time.sleep(delay)
                 continue
+
             raise
 
     raise RuntimeError(
         f"Historical data retries exhausted for {row['symbol']}."
     )
+
+
+def safe_float(value):
+    try:
+        number = float(value)
+        return number if pd.notna(number) else None
+    except (TypeError, ValueError):
+        return None
 
 
 def scan_loop():
@@ -359,10 +425,14 @@ def scan_loop():
         now = datetime.now(TZ)
 
         if market_open(now):
+            found = []
+            errors = 0
+            today = now.date()
+
             write_state(
                 running=True,
                 connected=True,
-                status="Scanning live market",
+                status="Starting market scan",
                 last_scan=None,
                 signals=[],
                 buy_count=0,
@@ -371,20 +441,35 @@ def scan_loop():
                 universe_count=len(symbols)
             )
 
-            found = []
-            errors = 0
-            today = datetime.now(TZ).date()
+            for index, row in enumerate(symbols, start=1):
+                if index == 1 or index % 10 == 0:
+                    write_state(
+                        running=True,
+                        connected=True,
+                        status=(
+                            f"Scanning live market "
+                            f"({index}/{len(symbols)}: {row['symbol']})"
+                        ),
+                        last_scan=None,
+                        signals=found[:250],
+                        buy_count=sum(
+                            x["signal"] == "BUY" for x in found
+                        ),
+                        sell_count=sum(
+                            x["signal"] == "SELL" for x in found
+                        ),
+                        error_count=errors,
+                        universe_count=len(symbols)
+                    )
 
-            for row in symbols:
                 try:
                     candles = candles_for(client, row)
                     result = scan_candles(candles, row["symbol"])
 
                     if not result.empty:
                         for record in result.to_dict("records"):
-                            raw_time = record.get("datetime_ist")
                             parsed_time = pd.to_datetime(
-                                raw_time,
+                                record.get("datetime_ist"),
                                 errors="coerce"
                             )
 
@@ -396,7 +481,6 @@ def scan_loop():
                             else:
                                 parsed_time = parsed_time.tz_convert(TZ)
 
-                            # Show only signals from today's session.
                             if parsed_time.date() != today:
                                 continue
 
@@ -406,17 +490,6 @@ def scan_loop():
 
                             if signal not in ("BUY", "SELL"):
                                 continue
-
-                            def safe_float(value):
-                                try:
-                                    number = float(value)
-                                    return (
-                                        number
-                                        if pd.notna(number)
-                                        else None
-                                    )
-                                except (TypeError, ValueError):
-                                    return None
 
                             item = {
                                 "time": parsed_time.isoformat(),
@@ -464,8 +537,8 @@ def scan_loop():
                         row["symbol"], exc
                     )
 
-                # Reduce pressure on the Kotak historical-data API.
-                time.sleep(2.5)
+                # Pace every stock request to reduce API pressure.
+                time.sleep(REQUEST_DELAY)
 
             found.sort(
                 key=lambda x: x["time"],
